@@ -131,9 +131,10 @@ export function DataProvider({ children }) {
     try {
       const res = await addRecord(payload);
       if (res.success) {
-        // Prepend/add to current records
-        setRecords(prev => [res.data, ...prev]);
+        // Append at the end in natural sequence matching Google Sheet order
+        setRecords(prev => [...prev, res.data]);
         showToast('Entry Added', `Successfully recorded for ${payload.firm}`, 'success');
+        loadData();
         return { success: true, data: res.data };
       } else {
         showToast('Submission Failed', res.error || 'Could not add entry', 'error');
