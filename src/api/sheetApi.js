@@ -1,6 +1,6 @@
 import { INITIAL_DEMO_RECORDS } from '../constants';
 
-const SCRIPT_URL = import.meta.env.VITE_SCRIPT_URL ? import.meta.env.VITE_SCRIPT_URL.trim() : '';
+export const DEFAULT_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxYg99ZB4HzJmLSZgdnr49MG-wBxvqqk_CAGOEUe9OIz-KHbTkoZg9hNgPKO4wj2itB/exec';
 
 const STORAGE_KEY = 'transit_vehicle_tracking_mock_db';
 
@@ -31,13 +31,14 @@ function saveLocalRecords(records) {
 export function getScriptUrl() {
   try {
     const localUrl = localStorage.getItem('transit_custom_script_url');
-    if (localUrl && localUrl.trim().startsWith('http')) {
+    if (localUrl && localUrl.trim().startsWith('https://script.google.com/macros/s/')) {
       return localUrl.trim();
     }
   } catch (e) {
     // ignore
   }
-  return import.meta.env.VITE_SCRIPT_URL ? import.meta.env.VITE_SCRIPT_URL.trim() : '';
+  const envUrl = import.meta.env.VITE_SCRIPT_URL ? import.meta.env.VITE_SCRIPT_URL.trim() : '';
+  return envUrl || DEFAULT_SCRIPT_URL;
 }
 
 export function setCustomScriptUrl(url) {
@@ -58,31 +59,74 @@ export function isLiveBackendConfigured() {
 }
 
 /**
- * Fetch records for a firm or ALL firms
+ * Fetch records for a firm or ALL firms with automatic retries and live caching
  */
 export async function listRecords(firm = 'ALL') {
-  if (isLiveBackendConfigured()) {
-    try {
-      const scriptUrl = getScriptUrl();
-      const url = `${scriptUrl}?action=list&firm=${encodeURIComponent(firm)}&_t=${Date.now()}`;
-      const res = await fetch(url);
-      const json = await res.json();
-      if (json && json.success) {
-        return { 
-          success: true, 
-          isLive: true, 
-          data: json.data || [], 
-          firms: Array.isArray(json.firms) && json.firms.length > 0 ? json.firms : null 
-        };
+  const scriptUrl = getScriptUrl();
+  if (scriptUrl && scriptUrl.startsWith('http')) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const url = `${scriptUrl}?action=list&firm=${encodeURIComponent(firm)}&_t=${Date.now()}`;
+        const res = await fetch(url);
+        const json = await res.json();
+        if (json && json.success) {
+          // Cache successful records so offline or reload always keeps real sheet data
+          try {
+            localStorage.setItem('transit_live_cached_records', JSON.stringify(json.data || []));
+            if (json.firms) localStorage.setItem('transit_cached_firms', JSON.stringify(json.firms));
+          } catch (e) {}
+
+          return { 
+            success: true, 
+            isLive: true, 
+            data: json.data || [], 
+            firms: Array.isArray(json.firms) && json.firms.length > 0 ? json.firms : null 
+          };
+        }
+        throw new Error(json?.error || 'Apps Script returned error');
+      } catch (err) {
+        lastError = err;
+        console.warn(`Apps Script fetch attempt ${attempt + 1} failed:`, err);
+        if (attempt < 2) {
+          await new Promise(r => setTimeout(r, 600));
+        }
       }
-      throw new Error(json?.error || 'Apps Script returned error');
-    } catch (err) {
-      console.warn('Apps Script fetch failed, falling back to local storage:', err);
-      // Fallback
     }
+
+    // If live fetch failed after 3 attempts, check if we have cached real records
+    try {
+      const cached = localStorage.getItem('transit_live_cached_records');
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const filtered = firm === 'ALL' ? parsed : parsed.filter(r => (r.firm || '').toUpperCase() === firm.toUpperCase());
+          let cachedFirms = null;
+          try {
+            const rawFirms = localStorage.getItem('transit_cached_firms');
+            if (rawFirms) cachedFirms = JSON.parse(rawFirms);
+          } catch (e) {}
+
+          return {
+            success: true,
+            isLive: true,
+            data: filtered,
+            firms: cachedFirms,
+            isCached: true
+          };
+        }
+      }
+    } catch (e) {}
+
+    return {
+      success: false,
+      isLive: true,
+      error: lastError ? lastError.message : 'Failed to reach Google Sheet backend',
+      data: []
+    };
   }
 
-  // Local storage mock fallback
+  // Fallback ONLY when NO script URL is configured at all
   const records = getLocalRecords();
   const filtered = firm === 'ALL' ? records : records.filter(r => (r.firm || '').toUpperCase() === firm.toUpperCase());
   return {
