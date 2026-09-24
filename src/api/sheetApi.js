@@ -3,6 +3,16 @@ import { INITIAL_DEMO_RECORDS } from '../constants';
 export const DEFAULT_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxYg99ZB4HzJmLSZgdnr49MG-wBxvqqk_CAGOEUe9OIz-KHbTkoZg9hNgPKO4wj2itB/exec';
 
 const STORAGE_KEY = 'transit_vehicle_tracking_mock_db';
+const LIVE_CACHE_KEY = 'transit_live_cached_records';
+const FIRMS_CACHE_KEY = 'transit_cached_firms';
+
+// In-flight request deduplication & short-lived memory cache (3.5s)
+let inFlightFetchPromise = null;
+let lastMemoryCache = {
+  timestamp: 0,
+  firm: null,
+  result: null
+};
 
 // Helper to get local mock data from localStorage
 function getLocalRecords() {
@@ -28,6 +38,18 @@ function saveLocalRecords(records) {
   }
 }
 
+// Helper to get cached live records
+export function getLiveCachedRecords() {
+  try {
+    const raw = localStorage.getItem(LIVE_CACHE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+  } catch (e) {}
+  return [];
+}
+
 export function getScriptUrl() {
   try {
     const localUrl = localStorage.getItem('transit_custom_script_url');
@@ -48,6 +70,8 @@ export function setCustomScriptUrl(url) {
     } else {
       localStorage.setItem('transit_custom_script_url', url.trim());
     }
+    // Invalidate memory cache on URL change
+    lastMemoryCache = { timestamp: 0, firm: null, result: null };
   } catch (e) {
     console.error('Failed to save custom script URL:', e);
   }
@@ -59,74 +83,121 @@ export function isLiveBackendConfigured() {
 }
 
 /**
- * Fetch records for a firm or ALL firms with automatic retries and live caching
+ * Fetch records for a firm or ALL firms with:
+ * 1. In-flight promise deduplication (never spam multiple parallel requests to Apps Script)
+ * 2. In-memory short-lived memoization (3.5s)
+ * 3. Fast abort timeout with instantaneous fallback to local cache
  */
-export async function listRecords(firm = 'ALL') {
+export async function listRecords(firm = 'ALL', forceRefresh = false) {
   const scriptUrl = getScriptUrl();
-  if (scriptUrl && scriptUrl.startsWith('http')) {
-    let lastError = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const url = `${scriptUrl}?action=list&firm=${encodeURIComponent(firm)}&_t=${Date.now()}`;
-        const res = await fetch(url);
-        const json = await res.json();
-        if (json && json.success) {
-          // Cache successful records so offline or reload always keeps real sheet data
-          try {
-            localStorage.setItem('transit_live_cached_records', JSON.stringify(json.data || []));
-            if (json.firms) localStorage.setItem('transit_cached_firms', JSON.stringify(json.firms));
-          } catch (e) {}
 
-          return { 
-            success: true, 
-            isLive: true, 
-            data: json.data || [], 
-            firms: Array.isArray(json.firms) && json.firms.length > 0 ? json.firms : null 
-          };
-        }
-        throw new Error(json?.error || 'Apps Script returned error');
-      } catch (err) {
-        lastError = err;
-        console.warn(`Apps Script fetch attempt ${attempt + 1} failed:`, err);
-        if (attempt < 2) {
-          await new Promise(r => setTimeout(r, 600));
-        }
-      }
+  // If live backend is configured
+  if (scriptUrl && scriptUrl.startsWith('http')) {
+    const now = Date.now();
+
+    // Check in-memory cache if not forced
+    if (
+      !forceRefresh &&
+      lastMemoryCache.firm === firm &&
+      now - lastMemoryCache.timestamp < 3500 &&
+      lastMemoryCache.result
+    ) {
+      return lastMemoryCache.result;
     }
 
-    // If live fetch failed after 3 attempts, check if we have cached real records
-    try {
-      const cached = localStorage.getItem('transit_live_cached_records');
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const filtered = firm === 'ALL' ? parsed : parsed.filter(r => (r.firm || '').toUpperCase() === firm.toUpperCase());
-          let cachedFirms = null;
-          try {
-            const rawFirms = localStorage.getItem('transit_cached_firms');
-            if (rawFirms) cachedFirms = JSON.parse(rawFirms);
-          } catch (e) {}
+    // If an identical fetch is already running, piggyback on that exact promise
+    if (inFlightFetchPromise && !forceRefresh) {
+      return inFlightFetchPromise;
+    }
 
-          return {
-            success: true,
-            isLive: true,
-            data: filtered,
-            firms: cachedFirms,
-            isCached: true
-          };
+    // Launch single optimized fetch
+    inFlightFetchPromise = (async () => {
+      let lastError = null;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 9000); // 9s timeout
+
+        try {
+          const cacheBuster = forceRefresh ? `&fresh=1&_t=${Date.now()}` : `&_t=${Math.floor(Date.now() / 15000)}`;
+          const url = `${scriptUrl}?action=list&firm=${encodeURIComponent(firm)}${cacheBuster}`;
+          
+          const res = await fetch(url, { signal: controller.signal });
+          clearTimeout(timeoutId);
+          
+          const json = await res.json();
+          if (json && json.success) {
+            // Cache successful records in localStorage
+            try {
+              localStorage.setItem(LIVE_CACHE_KEY, JSON.stringify(json.data || []));
+              if (json.firms) localStorage.setItem(FIRMS_CACHE_KEY, JSON.stringify(json.firms));
+            } catch (e) {}
+
+            const response = {
+              success: true,
+              isLive: true,
+              data: json.data || [],
+              firms: Array.isArray(json.firms) && json.firms.length > 0 ? json.firms : null
+            };
+
+            // Update in-memory cache
+            lastMemoryCache = {
+              timestamp: Date.now(),
+              firm,
+              result: response
+            };
+
+            return response;
+          }
+          throw new Error(json?.error || 'Apps Script returned error');
+        } catch (err) {
+          clearTimeout(timeoutId);
+          lastError = err;
+          console.warn(`Apps Script fetch attempt ${attempt + 1} notice:`, err.message || err);
+          if (attempt === 0) {
+            await new Promise(r => setTimeout(r, 400));
+          }
         }
       }
-    } catch (e) {}
 
-    return {
-      success: false,
-      isLive: true,
-      error: lastError ? lastError.message : 'Failed to reach Google Sheet backend',
-      data: []
-    };
+      // Fast fallback to cached live records if network fails or times out
+      try {
+        const cached = localStorage.getItem(LIVE_CACHE_KEY);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const filtered = firm === 'ALL' ? parsed : parsed.filter(r => (r.firm || '').toUpperCase() === firm.toUpperCase());
+            let cachedFirms = null;
+            try {
+              const rawFirms = localStorage.getItem(FIRMS_CACHE_KEY);
+              if (rawFirms) cachedFirms = JSON.parse(rawFirms);
+            } catch (e) {}
+
+            return {
+              success: true,
+              isLive: true,
+              data: filtered,
+              firms: cachedFirms,
+              isCached: true
+            };
+          }
+        }
+      } catch (e) {}
+
+      return {
+        success: false,
+        isLive: true,
+        error: lastError ? lastError.message : 'Failed to reach Google Sheet backend',
+        data: []
+      };
+    })().finally(() => {
+      inFlightFetchPromise = null;
+    });
+
+    return inFlightFetchPromise;
   }
 
-  // Fallback ONLY when NO script URL is configured at all
+  // Fallback ONLY when NO script URL is configured at all (Demo Mode)
   const records = getLocalRecords();
   const filtered = firm === 'ALL' ? records : records.filter(r => (r.firm || '').toUpperCase() === firm.toUpperCase());
   return {
@@ -144,7 +215,7 @@ export async function fetchFirms() {
   if (isLiveBackendConfigured()) {
     try {
       const scriptUrl = getScriptUrl();
-      const url = `${scriptUrl}?action=getFirms&_t=${Date.now()}`;
+      const url = `${scriptUrl}?action=getFirms&_t=${Math.floor(Date.now() / 60000)}`;
       const res = await fetch(url);
       const json = await res.json();
       if (json && json.success && Array.isArray(json.firms) && json.firms.length > 0) {
@@ -158,11 +229,21 @@ export async function fetchFirms() {
 }
 
 /**
- * Find record by invoice number across all firms
+ * Find record by invoice number:
+ * Checks local cache first for sub-millisecond response, then falls back to backend if not found!
  */
 export async function getByInvoice(invoiceNo) {
   if (!invoiceNo) return { success: false, error: 'Invoice number required' };
+  const cleanTarget = invoiceNo.trim().toLowerCase();
 
+  // 1. Instant check in live cached records (0ms response time!)
+  const liveCached = getLiveCachedRecords();
+  const cachedMatch = liveCached.find(r => (r.invoiceNo || '').trim().toLowerCase() === cleanTarget);
+  if (cachedMatch) {
+    return { success: true, isLive: true, data: cachedMatch, isInstant: true };
+  }
+
+  // 2. Query live Google Apps Script if not found locally
   if (isLiveBackendConfigured()) {
     try {
       const scriptUrl = getScriptUrl();
@@ -172,16 +253,15 @@ export async function getByInvoice(invoiceNo) {
       if (json && json.success) {
         return { success: true, isLive: true, data: json.data };
       }
-      throw new Error(json?.error || 'Record not found in Apps Script');
+      throw new Error(json?.error || 'Record not found in Google Sheet');
     } catch (err) {
-      console.warn('Apps Script invoice lookup failed, checking local records:', err);
+      console.warn('Apps Script invoice lookup failed, checking local mock store:', err);
     }
   }
 
-  // Local storage fallback
+  // 3. Local storage mock fallback
   const records = getLocalRecords();
-  const cleanTarget = invoiceNo.trim().toLowerCase();
-  const found = records.find(r => (r.invoiceNo || '').toLowerCase() === cleanTarget);
+  const found = records.find(r => (r.invoiceNo || '').trim().toLowerCase() === cleanTarget);
 
   if (found) {
     return { success: true, isLive: false, data: found };
@@ -190,9 +270,18 @@ export async function getByInvoice(invoiceNo) {
 }
 
 /**
+ * Invalidate memory cache so updates are immediately visible
+ */
+function invalidateLocalCache() {
+  lastMemoryCache = { timestamp: 0, firm: null, result: null };
+}
+
+/**
  * Add a new record
  */
 export async function addRecord(payload) {
+  invalidateLocalCache();
+
   if (isLiveBackendConfigured()) {
     try {
       const cleanPayload = { ...payload };
@@ -211,6 +300,12 @@ export async function addRecord(payload) {
       });
       const json = await res.json();
       if (json && json.success) {
+        // Also update local cached records immediately
+        try {
+          const cached = getLiveCachedRecords();
+          localStorage.setItem(LIVE_CACHE_KEY, JSON.stringify([...cached, json.data]));
+        } catch (e) {}
+
         return { success: true, isLive: true, data: json.data };
       }
       return { success: false, error: json?.error || 'Google Sheet add operation failed' };
@@ -229,7 +324,6 @@ export async function addRecord(payload) {
   let attachmentLink = payload.attachmentLink || '';
   let attachmentName = payload.attachmentName || '';
 
-  // If local base64 file provided, create a blob / data URL preview
   if (payload.file && payload.file.base64) {
     attachmentLink = payload.file.base64;
     attachmentName = payload.file.fileName || 'uploaded_document';
@@ -261,6 +355,8 @@ export async function addRecord(payload) {
  * Update an existing record
  */
 export async function updateRecord(payload) {
+  invalidateLocalCache();
+
   if (isLiveBackendConfigured()) {
     try {
       const cleanPayload = { ...payload };
@@ -279,6 +375,21 @@ export async function updateRecord(payload) {
       });
       const json = await res.json();
       if (json && json.success) {
+        // Also update local cached records immediately
+        try {
+          const cached = getLiveCachedRecords();
+          const next = cached.map(item => {
+            if (
+              (item.firm || '').toUpperCase() === (payload.firm || '').toUpperCase() &&
+              (String(item.slNo) === String(payload.slNo) || (payload.invoiceNo && item.invoiceNo === payload.invoiceNo))
+            ) {
+              return json.data;
+            }
+            return item;
+          });
+          localStorage.setItem(LIVE_CACHE_KEY, JSON.stringify(next));
+        } catch (e) {}
+
         return { success: true, isLive: true, data: json.data };
       }
       return { success: false, error: json?.error || 'Google Sheet update operation failed' };
@@ -335,6 +446,8 @@ export async function updateRecord(payload) {
  * Delete a record by Firm + Sl.no
  */
 export async function deleteRecord(firm, slNo) {
+  invalidateLocalCache();
+
   if (isLiveBackendConfigured()) {
     try {
       const res = await fetch(getScriptUrl(), {
@@ -344,6 +457,12 @@ export async function deleteRecord(firm, slNo) {
       });
       const json = await res.json();
       if (json && json.success) {
+        try {
+          const cached = getLiveCachedRecords();
+          const next = cached.filter(item => !(item.firm === firm && String(item.slNo) === String(slNo)));
+          localStorage.setItem(LIVE_CACHE_KEY, JSON.stringify(next));
+        } catch (e) {}
+
         return { success: true, isLive: true };
       }
       throw new Error(json?.error || 'Apps Script delete operation failed');

@@ -1,5 +1,5 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
-import { listRecords, addRecord, updateRecord, deleteRecord, isLiveBackendConfigured } from '../api/sheetApi';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { listRecords, addRecord, updateRecord, deleteRecord, isLiveBackendConfigured, getLiveCachedRecords } from '../api/sheetApi';
 import { FIRMS as DEFAULT_FIRMS } from '../constants';
 
 const DataContext = createContext(null);
@@ -16,15 +16,34 @@ export function DataProvider({ children }) {
     return DEFAULT_FIRMS;
   };
 
-  const [records, setRecords] = useState([]);
+  const getInitialRecords = () => {
+    const cached = getLiveCachedRecords();
+    if (cached && cached.length > 0) {
+      return cached.filter(r => 
+        (r.invoiceNo && r.invoiceNo.trim()) ||
+        (r.vendorName && r.vendorName.trim()) ||
+        (r.material && r.material.trim()) ||
+        (r.vehicleStatus && r.vehicleStatus.trim()) ||
+        (r.vehicleNo && r.vehicleNo.trim())
+      );
+    }
+    return [];
+  };
+
+  const initialRecords = getInitialRecords();
+  const [records, setRecords] = useState(initialRecords);
   const [firms, setFirms] = useState(getInitialFirms);
-  const [loading, setLoading] = useState(true);
+  
+  // Instant load: If we have cached records, do NOT block the screen with full-page loading!
+  const [loading, setLoading] = useState(initialRecords.length === 0);
   const [refreshing, setRefreshing] = useState(false);
-  const [lastUpdated, setLastUpdated] = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(() => initialRecords.length > 0 ? new Date() : null);
   const [selectedFirm, setSelectedFirm] = useState('ALL');
   const [isLive, setIsLive] = useState(isLiveBackendConfigured());
-  const [secondsUntilRefresh, setSecondsUntilRefresh] = useState(10);
+  const [secondsUntilRefresh, setSecondsUntilRefresh] = useState(15);
   const [toasts, setToasts] = useState([]);
+
+  const lastFocusTimeRef = useRef(0);
 
   const showToast = useCallback((title, message, type = 'success') => {
     const id = Date.now() + Math.random().toString();
@@ -38,13 +57,12 @@ export function DataProvider({ children }) {
     setToasts(prev => prev.filter(t => t.id !== id));
   }, []);
 
-  // Fetch all records & dynamic firms from Master sheet
+  // Fetch all records & dynamic firms from Google Sheets
   const loadData = useCallback(async (isManual = false) => {
     if (isManual) setRefreshing(true);
     try {
-      const res = await listRecords('ALL');
+      const res = await listRecords('ALL', isManual);
       if (res.success) {
-        // Filter out blank placeholder rows that have no actual shipment details
         const cleanData = (res.data || []).filter(r => 
           (r.invoiceNo && r.invoiceNo.trim()) ||
           (r.vendorName && r.vendorName.trim()) ||
@@ -55,14 +73,13 @@ export function DataProvider({ children }) {
         setRecords(cleanData);
         setIsLive(res.isLive);
         setLastUpdated(new Date());
-        setSecondsUntilRefresh(10);
+        setSecondsUntilRefresh(15);
 
         // Dynamic firms from Master sheet
         if (Array.isArray(res.firms) && res.firms.length > 0) {
           setFirms(res.firms);
           localStorage.setItem('transit_cached_firms', JSON.stringify(res.firms));
         } else if (Array.isArray(res.data) && res.data.length > 0) {
-          // Fallback: derive unique firms from sheet records
           const dataFirms = [...new Set(res.data.map(r => r.firm).filter(Boolean))];
           if (dataFirms.length > 0) {
             setFirms(prev => {
@@ -72,30 +89,32 @@ export function DataProvider({ children }) {
             });
           }
         }
-      } else {
+      } else if (isManual) {
         showToast('Fetch Warning', 'Could not refresh latest data from sheet.', 'error');
       }
     } catch (err) {
       console.error('Error fetching data:', err);
-      showToast('Connection Error', err.message || 'Error reaching backend', 'error');
+      if (isManual) {
+        showToast('Connection Error', err.message || 'Error reaching backend', 'error');
+      }
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
   }, [showToast]);
 
-  // Initial load
+  // Initial background load
   useEffect(() => {
-    loadData();
+    loadData(false);
   }, [loadData]);
 
-  // Fast 10-second auto-refresh countdown for live real-time sync with Google Sheets
+  // Background auto-refresh sync (15 seconds)
   useEffect(() => {
     const timer = setInterval(() => {
       setSecondsUntilRefresh(prev => {
         if (prev <= 1) {
-          loadData();
-          return 10;
+          loadData(false);
+          return 15;
         }
         return prev - 1;
       });
@@ -104,24 +123,27 @@ export function DataProvider({ children }) {
     return () => clearInterval(timer);
   }, [loadData]);
 
-  // Window Focus & Tab Switch Listener:
-  // Whenever user edits Google Sheet in another window/tab and returns to React app,
-  // it immediately pulls latest data from Google Sheets!
+  // Window Focus & Tab Switch Listener (Throttled to avoid rapid spam)
   useEffect(() => {
-    const handleFocus = () => {
-      loadData();
-    };
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        loadData();
+    const handleSyncOnFocus = () => {
+      const now = Date.now();
+      if (now - lastFocusTimeRef.current > 8000) {
+        lastFocusTimeRef.current = now;
+        loadData(false);
       }
     };
 
-    window.addEventListener('focus', handleFocus);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        handleSyncOnFocus();
+      }
+    };
+
+    window.addEventListener('focus', handleSyncOnFocus);
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
-      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('focus', handleSyncOnFocus);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [loadData]);
@@ -131,10 +153,10 @@ export function DataProvider({ children }) {
     try {
       const res = await addRecord(payload);
       if (res.success) {
-        // Append at the end in natural sequence matching Google Sheet order
         setRecords(prev => [...prev, res.data]);
         showToast('Entry Added', `Successfully recorded for ${payload.firm}`, 'success');
-        loadData();
+        // Background sync to ensure slNo & order are 100% sheet-aligned
+        loadData(false);
         return { success: true, data: res.data };
       } else {
         showToast('Submission Failed', res.error || 'Could not add entry', 'error');
@@ -158,6 +180,7 @@ export function DataProvider({ children }) {
           return item;
         }));
         showToast('Entry Updated', `Updated record for ${payload.firm}`, 'success');
+        loadData(false);
         return { success: true, data: res.data };
       } else {
         showToast('Update Failed', res.error || 'Could not update entry', 'error');
@@ -176,6 +199,7 @@ export function DataProvider({ children }) {
       if (res.success) {
         setRecords(prev => prev.filter(item => !((item.firm || '').toUpperCase() === (firm || '').toUpperCase() && String(item.slNo) === String(slNo))));
         showToast('Entry Deleted', `Removed Sl.no #${slNo} from ${firm}`, 'success');
+        loadData(false);
         return { success: true };
       } else {
         showToast('Delete Failed', res.error || 'Could not delete entry', 'error');
